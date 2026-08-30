@@ -1,0 +1,173 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+
+# Configuration de la page
+st.set_page_config(
+    page_title="Canaux de Régression Boursière",
+    page_icon="📈",
+    layout="wide"
+)
+
+st.title("📈 Canaux de Régression Linéaire & Écart-Type")
+st.markdown("""
+Analysez la tendance historique de long terme de n'importe quelle action mondiale 
+(marchés français `.PA`, américains, européens, etc.) avec les bandes de dispersion à **$\pm 1\sigma$** et **$\pm 2\sigma$**.
+""")
+
+# --- Barre latérale de configuration ---
+with st.sidebar:
+    st.header("⚙️ Paramètres de calcul")
+    
+    ticker_input = st.text_input(
+        "Ticker boursier (Yahoo Finance) :",
+        value="OR.PA",
+        help="Exemples : OR.PA (L'Oréal), MC.PA (LVMH), AAPL (Apple), MSFT (Microsoft), NVDA (Nvidia), SPY (S&P 500)"
+    ).strip().upper()
+
+    years_back = st.slider("Historique (en années) :", min_value=3, max_value=40, value=15, step=1)
+    
+    model_type = st.radio(
+        "Modèle mathématique :",
+        ["Linéaire classique (y = ax + b)", "Logarithmique / CAGR (Croissance exponentielle)"],
+        index=0
+    )
+    
+    use_adj_close = st.checkbox("Ajuster des dividendes & splits (Recommandé)", value=True)
+
+# --- Récupération des données boursières ---
+if ticker_input:
+    try:
+        ticker = yf.Ticker(ticker_input)
+        start_date = datetime.now() - timedelta(days=int(years_back * 365.25))
+        
+        with st.spinner(f"Récupération des cotations pour {ticker_input}..."):
+            df = ticker.history(start=start_date.strftime('%Y-%m-%d'), auto_adjust=use_adj_close)
+            info = ticker.info
+            company_name = info.get('shortName', ticker_input)
+            currency = info.get('currency', 'EUR')
+            
+        if df.empty or len(df) < 50:
+            st.error("Données insuffisantes ou ticker introuvable. Vérifiez le symbole (ex: OR.PA pour L'Oréal).")
+            st.stop()
+            
+        df = df.reset_index()
+        # Harmonisation du fuseau horaire des dates
+        df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
+        
+        # --- Calcul de la régression linéaire ---
+        df['Time_Index'] = np.arange(len(df))
+        prices = df['Close'].values
+        
+        if "Logarithmique" in model_type:
+            log_prices = np.log(prices)
+            slope, intercept = np.polyfit(df['Time_Index'], log_prices, 1)
+            trend_log = slope * df['Time_Index'] + intercept
+            residuals = log_prices - trend_log
+            std_dev = np.std(residuals)
+            
+            df['Trend'] = np.exp(trend_log)
+            df['Plus_1_Sigma'] = np.exp(trend_log + std_dev)
+            df['Plus_2_Sigma'] = np.exp(trend_log + 2 * std_dev)
+            df['Minus_1_Sigma'] = np.exp(trend_log - std_dev)
+            df['Minus_2_Sigma'] = np.exp(trend_log - 2 * std_dev)
+            
+            # Calcul du R2
+            r2 = 1 - (np.sum(residuals**2) / np.sum((log_prices - np.mean(log_prices))**2))
+            # CAGR théorique
+            cagr = (np.exp(slope * 252) - 1) * 100
+        else:
+            slope, intercept = np.polyfit(df['Time_Index'], prices, 1)
+            trend = slope * df['Time_Index'] + intercept
+            residuals = prices - trend
+            std_dev = np.std(residuals)
+            
+            df['Trend'] = trend
+            df['Plus_1_Sigma'] = trend + std_dev
+            df['Plus_2_Sigma'] = trend + 2 * std_dev
+            df['Minus_1_Sigma'] = trend - std_dev
+            df['Minus_2_Sigma'] = trend - 2 * std_dev
+            
+            r2 = 1 - (np.sum(residuals**2) / np.sum((prices - np.mean(prices))**2))
+            annual_slope = slope * 252
+
+        # Calcul de la position actuelle
+        last_price = prices[-1]
+        last_trend = df['Trend'].iloc[-1]
+        
+        if "Logarithmique" in model_type:
+            z_score = (np.log(last_price) - np.log(last_trend)) / std_dev
+        else:
+            z_score = (last_price - last_trend) / std_dev
+
+        # --- Affichage des métriques clés ---
+        st.subheader(f"📊 Analyse de {company_name} ({ticker_input})")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Dernier cours", f"{last_price:.2f} {currency}")
+        col2.metric("Cours central estimé", f"{last_trend:.2f} {currency}")
+        col3.metric("Positionnement (Z-Score)", f"{z_score:+.2f} σ")
+        col4.metric("Qualité d'ajustement (R²)", f"{r2:.3f}")
+
+        # Diagnostic automatique
+        if z_score > 2.0:
+            st.error("⚠️ **Zone de surévaluation extrême (+2σ)** : le cours est très au-dessus de sa tendance historique.")
+        elif z_score > 1.0:
+            st.warning("📈 **Zone haute (+1σ à +2σ)** : le cours est au-dessus de sa moyenne historique.")
+        elif z_score >= -1.0:
+            st.success("⚖️ **Zone neutre ([-1σ ; +1σ])** : le cours oscille normalement autour de sa droite de tendance.")
+        elif z_score >= -2.0:
+            st.info("📉 **Zone basse (-1σ à -2σ)** : le titre est sous sa tendance de long terme.")
+        else:
+            st.success("💎 **Zone de sous-évaluation extrême (-2σ)** : le titre est historiquement très décoté.")
+
+        # --- Tracé du graphique interactif Plotly ---
+        fig = go.Figure()
+
+        # Bandes d'écart-type
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['Plus_2_Sigma'], line=dict(color='rgba(231, 76, 60, 0.4)', dash='dash'), name='+2 Écarts-types (+2σ)'))
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['Plus_1_Sigma'], line=dict(color='rgba(243, 156, 18, 0.5)', dash='dot'), name='+1 Écart-type (+1σ)'))
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['Trend'], line=dict(color='royalblue', width=2.5), name='Droite de Tendance Centrale'))
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['Minus_1_Sigma'], line=dict(color='rgba(46, 204, 113, 0.5)', dash='dot'), name='-1 Écart-type (-1σ)'))
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['Minus_2_Sigma'], line=dict(color='rgba(39, 174, 96, 0.4)', dash='dash'), name='-2 Écarts-types (-2σ)'))
+
+        # Cours de l'action
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], line=dict(color='black', width=1.5), name=f'Cours réel ({company_name})'))
+
+        fig.update_layout(
+            title=f"Canaux de tendance sur {years_back} ans",
+            xaxis_title="Date",
+            yaxis_title=f"Prix ({currency})",
+            hovermode="x unified",
+            template="plotly_white",
+            height=600,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        # --- Tableau récapitulatif des niveaux de prix ---
+        st.subheader("🎯 Niveaux de prix calculés à ce jour")
+        summary_table = pd.DataFrame({
+            "Niveau statistique": [
+                "+2σ (Bande haute extrême)",
+                "+1σ (Bande haute)",
+                "Tendance centrale (Moyenne)",
+                "-1σ (Bande basse)",
+                "-2σ (Bande basse extrême)"
+            ],
+            f"Cours théorique ({currency})": [
+                f"{df['Plus_2_Sigma'].iloc[-1]:.2f}",
+                f"{df['Plus_1_Sigma'].iloc[-1]:.2f}",
+                f"{df['Trend'].iloc[-1]:.2f}",
+                f"{df['Minus_1_Sigma'].iloc[-1]:.2f}",
+                f"{df['Minus_2_Sigma'].iloc[-1]:.2f}"
+            ]
+        })
+        st.dataframe(summary_table, use_container_width=True, hide_index=True)
+
+    except Exception as e:
+        st.error(f"Une erreur s'est produite lors du traitement : {e}")
